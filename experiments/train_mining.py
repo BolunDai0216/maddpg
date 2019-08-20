@@ -1,3 +1,5 @@
+#!/usr/bin/python3
+import MiningEnv
 import argparse
 import numpy as np
 import tensorflow as tf
@@ -6,6 +8,7 @@ import pickle
 from pdb import set_trace
 import os
 import errno
+import gym
 
 import maddpg.common.tf_util as U
 from maddpg.trainer.maddpg import MADDPGAgentTrainer
@@ -18,13 +21,13 @@ def parse_args():
     # Environment
     parser.add_argument("--scenario", type=str, default="simple",
                         help="name of the scenario script")
-    parser.add_argument("--max-episode-len", type=int, default=25, help="maximum episode length")
+    parser.add_argument("--max-episode-len", type=int, default=100, help="maximum episode length")
     parser.add_argument("--num-episodes", type=int, default=60000, help="number of episodes")
     parser.add_argument("--num-adversaries", type=int, default=0, help="number of adversaries")
     parser.add_argument("--good-policy", type=str, default="maddpg", help="policy for good agents")
     parser.add_argument("--adv-policy", type=str, default="maddpg", help="policy of adversaries")
     # Core training parameters
-    parser.add_argument("--lr", type=float, default=1e-2, help="learning rate for Adam optimizer")
+    parser.add_argument("--lr", type=float, default=1e-3, help="learning rate for Adam optimizer")
     parser.add_argument("--gamma", type=float, default=0.95, help="discount factor")
     parser.add_argument("--batch-size", type=int, default=1024,
                         help="number of episodes to optimize at the same time")
@@ -56,45 +59,25 @@ def mlp_model(input, num_outputs, scope, reuse=False, num_units=64, rnn_cell=Non
         out = input
         out = layers.fully_connected(out, num_outputs=num_units, activation_fn=tf.nn.relu)
         out = layers.fully_connected(out, num_outputs=num_units, activation_fn=tf.nn.relu)
-        out = layers.fully_connected(out, num_outputs=num_outputs, activation_fn=None)
+        out = layers.fully_connected(out, num_outputs=num_outputs, activation_fn=tf.nn.sigmoid)
         return out
 
 
-def make_env(scenario_name, arglist, benchmark=False):
+def make_env():
     # To change the environment all that is required is to alter this function
-    # Change the imports to our MiningEnv
-    from multiagent.environment import MultiAgentEnv
-    import multiagent.scenarios as scenarios
-
-    # load scenario from script
-    scenario = scenarios.load(scenario_name + ".py").Scenario()
-    # create world
-    world = scenario.make_world()
-    # create multiagent environment
-    if benchmark:
-        env = MultiAgentEnv(world, scenario.reset_world, scenario.reward,
-                            scenario.observation, scenario.benchmark_data)
-    else:
-        env = MultiAgentEnv(world, scenario.reset_world, scenario.reward, scenario.observation)
+    env = gym.make('MiningEnv-v0')
     return env
 
 
-def get_trainers(env, num_adversaries, obs_shape_n, arglist):
+def get_trainers(env, obs_shape_n, arglist):
     trainers = []
     model = mlp_model
     trainer = MADDPGAgentTrainer
-    # Create trainers for adversarial agents
-    for i in range(num_adversaries):
-        trainers.append(trainer(
-            "agent_%d" % i, model, obs_shape_n, env.action_space, i, arglist,
-            local_q_func=(arglist.adv_policy == 'ddpg')))
-        set_trace()
-    # Crset_trace()eate trainers for good agents
-    for i in range(num_adversaries, env.n):
+    # Create trainers for good agents
+    for i in range(env.n):
         trainers.append(trainer(
             "agent_%d" % i, model, obs_shape_n, env.action_space, i, arglist,
             local_q_func=(arglist.good_policy == 'ddpg')))
-        set_trace()
     return trainers
 
 
@@ -111,12 +94,11 @@ def create_if_not_exist(filename):
 def train(arglist):
     with U.single_threaded_session():
         # Create environment
-        env = make_env(arglist.scenario, arglist, arglist.benchmark)
+        env = make_env()
         # Create agent trainers
         obs_shape_n = [env.observation_space[i].shape for i in range(env.n)]
-        num_adversaries = min(env.n, arglist.num_adversaries)
-        set_trace()
-        trainers = get_trainers(env, num_adversaries, obs_shape_n, arglist)
+        num_adversaries = 0
+        trainers = get_trainers(env, obs_shape_n, arglist)
         print('Using good policy {} and adv policy {}'.format(
             arglist.good_policy, arglist.adv_policy))
 
@@ -141,13 +123,25 @@ def train(arglist):
         episode_step = 0
         train_step = 0
         t_start = time.time()
+        update_num = 0
 
         print('Starting iterations...')
         while True:
             # get action
             action_n = [agent.action(obs) for agent, obs in zip(trainers, obs_n)]
+
+            truck_trgt, excvtr_trgt = action_n
+            # Make sure the action is within the action space
+            truck_trgt = np.clip(
+                truck_trgt, env.action_space[0].low, env.action_space[0].high)
+            excvtr_trgt = np.clip(
+                excvtr_trgt, env.action_space[1].low, env.action_space[1].high)
+
+            action_n = [truck_trgt, excvtr_trgt]
+
             # environment step
             new_obs_n, rew_n, done_n, info_n = env.step(action_n)
+
             episode_step += 1
             # Check for episode termination
             done = all(done_n)
@@ -161,7 +155,10 @@ def train(arglist):
                 episode_rewards[-1] += rew
                 agent_rewards[i][-1] += rew
 
+            # print('Action is {}'.format(action_n))
+
             if done or terminal:
+                # print('episode: {}, reward: {}'.format(len(episode_rewards), episode_rewards[-1]))
                 obs_n = env.reset()
                 episode_step = 0
                 episode_rewards.append(0)
@@ -171,18 +168,6 @@ def train(arglist):
 
             # increment global step counter
             train_step += 1
-
-            # for benchmarking learned policies
-            if arglist.benchmark:
-                for i, info in enumerate(info_n):
-                    agent_info[-1][i].append(info_n['n'])
-                if train_step > arglist.benchmark_iters and (done or terminal):
-                    file_name = arglist.benchmark_dir + arglist.exp_name + '.pkl'
-                    print('Finished benchmarking, now saving...')
-                    with open(file_name, 'wb') as fp:
-                        pickle.dump(agent_info[:-1], fp)
-                    break
-                continue
 
             # for displaying learned policies
             if arglist.display:
@@ -198,7 +183,7 @@ def train(arglist):
                 loss = agent.update(trainers, train_step)
 
             # save model, display training output
-            if terminal and (len(episode_rewards) % arglist.save_rate == 0):
+            if (terminal or done) and (len(episode_rewards) % arglist.save_rate == 0) and not (arglist.display or arglist.restore):
                 U.save_state(arglist.save_dir, saver=saver)
                 # print statement depends on whether or not there are adversaries
                 if num_adversaries == 0:
@@ -216,7 +201,8 @@ def train(arglist):
                     final_ep_ag_rewards.append(np.mean(rew[-arglist.save_rate:]))
 
             # saves final episode reward for plotting training curve later
-            if len(episode_rewards) > arglist.num_episodes:
+            if len(episode_rewards) >= arglist.num_episodes:
+                print('average reward is: {}'.format(np.mean(episode_rewards)))
                 rew_file_name = arglist.plots_dir + arglist.exp_name + '_rewards.pkl'
                 create_if_not_exist(rew_file_name)
                 with open(rew_file_name, 'wb') as fp:
